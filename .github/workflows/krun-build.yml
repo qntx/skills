@@ -1,0 +1,123 @@
+name: Build libkrun Libraries
+
+# Triggered by pushing a krun version tag, or manually.
+on:
+  push:
+    tags: ["krun-v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pin native library versions — keep in sync with bux-krun/build.rs HEADER_URL.
+  LIBKRUN_VERSION: "1.17.4"
+  LIBKRUNFW_VERSION: "5.2.1"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libkrun & libkrunfw (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew tap slp/krun
+          brew install slp/krun/libkrunfw slp/krun/libkrun
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential patchelf libfdt-dev \
+            clang libclang-dev libcap-ng-dev
+
+      - name: Download libkrunfw (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ARCH=$(uname -m)
+          mkdir -p "${{ github.workspace }}/prefix"
+          curl -fsSL "https://github.com/containers/libkrunfw/releases/download/v${LIBKRUNFW_VERSION}/libkrunfw-${ARCH}.tgz" | \
+            tar xz -C "${{ github.workspace }}/prefix"
+
+      - name: Build libkrun (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          export PKG_CONFIG_PATH="${{ github.workspace }}/prefix/lib64/pkgconfig"
+          git clone --depth 1 --branch "v${LIBKRUN_VERSION}" --recurse-submodules \
+            https://github.com/containers/libkrun.git libkrun-src
+          cd libkrun-src
+          make -j$(nproc) NET=1 BLK=1
+          make PREFIX="${{ github.workspace }}/prefix" install
+
+      - name: Package libraries
+        run: |
+          mkdir dist
+
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # Copy from Homebrew Cellar (-L resolves symlinks)
+            KRUN="$(brew --prefix libkrun)/lib"
+            KRUNFW="$(brew --prefix libkrunfw)/lib"
+            cp -L "$KRUN/libkrun.dylib" dist/
+            cp -L "$KRUNFW/libkrunfw.dylib" dist/
+            # Fix install names for portable redistribution
+            install_name_tool -id "@rpath/libkrun.dylib" dist/libkrun.dylib
+            install_name_tool -id "@rpath/libkrunfw.dylib" dist/libkrunfw.dylib
+            codesign -s - --force dist/libkrun.dylib
+            codesign -s - --force dist/libkrunfw.dylib
+          else
+            LIB="${{ github.workspace }}/prefix/lib64"
+            cp -L "$LIB/libkrun.so" dist/
+            cp -L "$LIB/libkrunfw.so" dist/
+            patchelf --set-soname libkrun.so dist/libkrun.so
+            patchelf --set-soname libkrunfw.so dist/libkrunfw.so
+          fi
+
+          ls -la dist/
+          tar -czf "bux-deps-${{ matrix.target }}.tar.gz" -C dist .
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: bux-deps-${{ matrix.target }}
+          path: bux-deps-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/krun-v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: bux-deps-*.tar.gz
+          generate_release_notes: true
+
+  publish-krun:
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/krun-v')
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish -p bux-krun
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
